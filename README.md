@@ -52,20 +52,6 @@ Utilizamos o **Mapillary Street-level Sequences (MSLS) Dataset**.
 
 ---
 
-## 📅 Roadmap e Cronograma
-
-O desenvolvimento está estruturado em 5 semanas intensivas:
-
-| Fase | Descrição | Período | Status |
-| :--- | :--- | :--- | :--- |
-| **01** | **Fundação e Dados:** Download do MSLS, seleção das 30 cidades, split de dados e criação dos DataLoaders básicos. | 11/11 - 17/11 | ✅ Concluído |
-| **02** | **Baseline Visual:** Implementação e fine-tuning do ViT (Visual-Puro). Estabelecimento da métrica base. | 18/11 - 24/11 | 🔄 Em Progresso |
-| **03** | **Pipeline de Texto:** Integração do OCR e geração de metadados de linguagem (offline extraction) para todo o dataset. | 18/11 - 24/11 | 🔄 Em Progresso |
-| **04** | **Modelo Multi-Modal:** Adaptação da arquitetura para fusão (Concat), treino do modelo híbrido e fine-tuning na GPU (RTX 4080). | 25/11 - 01/12 | 📅 Planejado |
-| **05** | **Análise e Defesa:** Comparação Visual vs. Multi-Modal, geração de gráficos, análise de erros e relatório final. | 02/12 - 07/12 | 📅 Planejado |
-
----
-
 ## 🚀 Como Executar (Em breve)
 
 ### Pré-requisitos
