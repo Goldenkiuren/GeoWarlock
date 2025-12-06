@@ -11,16 +11,15 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 
-# --- HARDWARE OPTIMIZATIONS (RTX 4080 SPECIFIC) ---
-# 1. Enable TF32 for faster math on Ampere/Ada GPUs
+# --- HARDWARE OPTIMIZATIONS ---
+# Enable TF32 (Massive speedup on RTX 4080)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# 2. Enable cuDNN benchmarking to pick the fastest convolution algos
 torch.backends.cudnn.benchmark = True
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-NUM_EPOCHS = 15
+NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
@@ -133,7 +132,6 @@ def main():
     train_paths, train_y, val_paths, val_y, num_classes = create_splits(dataset_root)
     print(f"Total: {len(train_paths)} Train, {len(val_paths)} Val")
 
-    # Transforms (kept same)
     train_transform = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -151,14 +149,12 @@ def main():
     train_dataset = CityClassificationDataset(train_paths, train_y, transform=train_transform)
     val_dataset = CityClassificationDataset(val_paths, val_y, transform=val_transform)
 
-    # 3. DATALOADER OPTIMIZATION
-    # persistent_workers=True keeps the RAM loaded between epochs
-    # prefetch_factor buffers batches so GPU never waits for CPU
+    # UPDATED: Increased workers slightly for your high-end CPU
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=8, 
+        num_workers=12,  # Increased from 8
         pin_memory=True,
         persistent_workers=True, 
         prefetch_factor=2
@@ -175,9 +171,6 @@ def main():
 
     model = ViTForCityClassification(num_classes=num_classes).to(DEVICE)
     
-    # 4. MODEL COMPILATION (The Big Speedup)
-    # This fuses layers and optimizes for the 4080 specifically
-    print("Compiling model (this takes a minute at start)...")
     model = torch.compile(model)
 
     criterion = nn.CrossEntropyLoss()
@@ -192,7 +185,6 @@ def main():
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
         for images, labels in loop:
-            # non_blocking allows async data transfer
             images, labels = images.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
             optimizer.zero_grad()
