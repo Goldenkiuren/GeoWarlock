@@ -16,6 +16,7 @@ dependencies = [
     "scikit-learn",
     "pillow",
     "matplotlib",
+    "tqdm>=4.67.1",
 ]
 
 [tool.uv]

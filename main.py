@@ -1,148 +1,228 @@
 import os
 import pandas as pd
-import random
+import numpy as np
 import torch
-import torch.nn.functional as F
-from torch import nn, optim
-from torch.utils.data import DataLoader, Dataset
-import torchvision.models as models
-import torchvision.transforms as transforms
-from PIL import Image
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from PIL import Image, ImageFile
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
 
-# --- DATASET (Mantido igual, apenas compactado aqui para contexto) ---
-class MSLSTripletDataset(Dataset):
-    def __init__(self, root_dir, split='train_val', transform=None):
-        self.root_dir = os.path.join(root_dir, split)
+# --- HARDWARE OPTIMIZATIONS (RTX 4080 SPECIFIC) ---
+# 1. Enable TF32 for faster math on Ampere/Ada GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# 2. Enable cuDNN benchmarking to pick the fastest convolution algos
+torch.backends.cudnn.benchmark = True
+
+# --- CONFIGURATION ---
+BATCH_SIZE = 128
+NUM_EPOCHS = 15
+LEARNING_RATE = 1e-4
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IMG_SIZE = 224
+USE_SPATIAL_SPLIT = True 
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# Paths
+DB_SUBPATH = os.path.join('database', 'images') 
+SEQ_INFO_FILE = os.path.join('database', 'seq_info.csv')
+RAW_DATA_FILE = os.path.join('database', 'raw.csv')
+
+class CityClassificationDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels
         self.transform = transform
-        self.sequence_map = {} 
-        self.valid_keys = []
-        
-        if not os.path.exists(self.root_dir):
-            raise ValueError(f"Diretório não encontrado: {self.root_dir}")
-            
-        cities = [d for d in os.listdir(self.root_dir) if os.path.isdir(os.path.join(self.root_dir, d))]
-        print(f"Indexando sequências de {len(cities)} cidades...")
-        
-        for city in cities:
-            db_path = os.path.join(self.root_dir, city, 'database')
-            images_path = os.path.join(db_path, 'images')
-            csv_path = os.path.join(db_path, 'seq_info.csv') # Usamos seq_info, não subtask_index
-            
-            if os.path.exists(csv_path) and os.path.exists(images_path):
-                df = pd.read_csv(csv_path, usecols=['key', 'sequence_key'])
-                for _, row in df.iterrows():
-                    seq_key = row['sequence_key']
-                    img_key = row['key']
-                    full_img_path = os.path.join(images_path, f"{img_key}.jpg")
-                    
-                    # Verificação rápida de existência (opcional se confiar nos dados)
-                    # if os.path.exists(full_img_path): 
-                    if seq_key not in self.sequence_map:
-                        self.sequence_map[seq_key] = []
-                    self.sequence_map[seq_key].append(full_img_path)
-
-        # Filtra sequências com apenas 1 imagem e cria lista de chaves
-        self.sequence_map = {k: v for k, v in self.sequence_map.items() if len(v) > 1}
-        self.valid_keys = list(self.sequence_map.keys())
-        print(f"Dataset pronto: {len(self.valid_keys)} sequências válidas.")
 
     def __len__(self):
-        return len(self.valid_keys)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        anchor_seq = self.valid_keys[idx]
-        imgs = self.sequence_map[anchor_seq]
-        
-        # Estratégia simples de mineração
-        anchor_path = random.choice(imgs)
-        positive_path = random.choice(imgs)
-        while positive_path == anchor_path and len(imgs) > 1:
-            positive_path = random.choice(imgs)
-            
-        neg_seq = random.choice(self.valid_keys)
-        while neg_seq == anchor_seq:
-            neg_seq = random.choice(self.valid_keys)
-        negative_path = random.choice(self.sequence_map[neg_seq])
-        
-        return self._load(anchor_path), self._load(positive_path), self._load(negative_path)
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        try:
+            image = Image.open(img_path).convert("RGB")
+            if self.transform:
+                image = self.transform(image)
+            return image, label
+        except Exception:
+            return torch.zeros((3, IMG_SIZE, IMG_SIZE)), label
 
-    def _load(self, path):
-        return self.transform(Image.open(path).convert('RGB'))
+def create_splits(root_dir, val_size=0.2):
+    train_paths, train_labels = [], []
+    val_paths, val_labels = [], []
+    
+    classes = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+    classes.sort()
+    class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+    
+    print(f"Found {len(classes)} cities. Using Spatial Split: {USE_SPATIAL_SPLIT}")
 
-# --- MODELO VPR ---
-class VPRModel(nn.Module):
-    def __init__(self):
-        super(VPRModel, self).__init__()
-        # Backbone: ResNet18 (leve para testar) ou ResNet50
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    for city in classes:
+        city_path = os.path.join(root_dir, city)
+        images_dir = os.path.join(city_path, DB_SUBPATH)
+        seq_path = os.path.join(city_path, SEQ_INFO_FILE)
+        raw_path = os.path.join(city_path, RAW_DATA_FILE)
         
-        # Removemos o FC original e AvgPool para acesso direto aos features
-        # Mas para simplificar, vamos usar a saída do FC modificado
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1]) # Remove fc layer
-        self.fc = nn.Linear(512, 512) # Projeção
+        if not os.path.exists(images_dir):
+            continue
+
+        valid_exts = ('.jpg', '.jpeg', '.png')
+        key_to_path = {os.path.splitext(f)[0]: os.path.join(images_dir, f) 
+                       for f in os.listdir(images_dir) if f.lower().endswith(valid_exts)}
         
+        # Strategy 1: Spatial Split
+        if USE_SPATIAL_SPLIT and os.path.exists(raw_path):
+            try:
+                df_raw = pd.read_csv(raw_path)
+                df_raw = df_raw[df_raw['key'].isin(key_to_path.keys())]
+                coords = df_raw[['lat', 'lon']].values
+                kmeans = KMeans(n_clusters=5, n_init=10, random_state=42)
+                df_raw['cluster'] = kmeans.fit_predict(coords)
+                
+                val_cluster_id = 0 
+                train_keys = df_raw[df_raw['cluster'] != val_cluster_id]['key'].tolist()
+                val_keys = df_raw[df_raw['cluster'] == val_cluster_id]['key'].tolist()
+                
+                print(f"  {city} (Spatial): Train {len(train_keys)} | Val {len(val_keys)}")
+                for k in train_keys: train_paths.append(key_to_path[k]); train_labels.append(class_to_idx[city])
+                for k in val_keys: val_paths.append(key_to_path[k]); val_labels.append(class_to_idx[city])
+                continue 
+            except Exception:
+                pass 
+
+        # Strategy 2: Sequence Split (Fallback)
+        if os.path.exists(seq_path):
+            df = pd.read_csv(seq_path)
+            df = df[df['key'].isin(key_to_path.keys())]
+            if 'sequence_key' in df.columns:
+                seq_groups = df.groupby('sequence_key')['key'].apply(list).tolist()
+                train_seqs, val_seqs = train_test_split(seq_groups, test_size=val_size, random_state=42)
+                for seq in train_seqs:
+                    for k in seq: train_paths.append(key_to_path[k]); train_labels.append(class_to_idx[city])
+                for seq in val_seqs:
+                    for k in seq: val_paths.append(key_to_path[k]); val_labels.append(class_to_idx[city])
+                print(f"  {city} (Sequence): Train {len(train_seqs)} seqs | Val {len(val_seqs)} seqs")
+
+    return train_paths, train_labels, val_paths, val_labels, len(classes)
+
+class ViTForCityClassification(nn.Module):
+    def __init__(self, num_classes):
+        super(ViTForCityClassification, self).__init__()
+        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        input_dim = self.vit.heads.head.in_features
+        self.vit.heads = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+
     def forward(self, x):
-        x = self.backbone(x)
-        x = x.view(x.size(0), -1) # Flatten
-        x = self.fc(x)
-        # CRÍTICO: Normalização L2
-        # Isso garante que todos os vetores vivam numa hiperesfera unitária
-        return F.normalize(x, p=2, dim=1)
+        return self.vit(x)
 
-# --- EXECUÇÃO ---
-if __name__ == '__main__':
-    # 1. Configurações
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}")
+def main():
+    dataset_root = "data" 
+    
+    print("Preparing Robust Splits...")
+    train_paths, train_y, val_paths, val_y, num_classes = create_splits(dataset_root)
+    print(f"Total: {len(train_paths)} Train, {len(val_paths)} Val")
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+    # Transforms (kept same)
+    train_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomRotation(degrees=15),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # 2. Dataset e DataLoader
-    # Ajuste o root_dir conforme sua estrutura real
-    dataset = MSLSTripletDataset(root_dir='.', split='train_val', transform=transform)
+    train_dataset = CityClassificationDataset(train_paths, train_y, transform=train_transform)
+    val_dataset = CityClassificationDataset(val_paths, val_y, transform=val_transform)
+
+    # 3. DATALOADER OPTIMIZATION
+    # persistent_workers=True keeps the RAM loaded between epochs
+    # prefetch_factor buffers batches so GPU never waits for CPU
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True, 
+        prefetch_factor=2
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=8, 
+        pin_memory=True,
+        persistent_workers=True, 
+        prefetch_factor=2
+    )
+
+    model = ViTForCityClassification(num_classes=num_classes).to(DEVICE)
     
-    # Num_workers > 0 requer o bloco if __name__ == '__main__' no Windows
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
+    # 4. MODEL COMPILATION (The Big Speedup)
+    # This fuses layers and optimizes for the 4080 specifically
+    print("Compiling model (this takes a minute at start)...")
+    model = torch.compile(model)
 
-    # 3. Inicialização
-    model = VPRModel().to(device)
-    criterion = nn.TripletMarginLoss(margin=0.6, p=2)
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-
-    # 4. Loop de Treino
-    print("Iniciando treinamento...")
-    model.train()
-
-    epochs = 3
-    for epoch in range(epochs):
-        total_loss = 0
-        for i, (anchor, positive, negative) in enumerate(dataloader):
-            anchor, positive, negative = anchor.to(device), positive.to(device), negative.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    scaler = torch.amp.GradScaler('cuda')
+    
+    print(f"Starting Training on {DEVICE}...")
+    
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        train_loss, correct, total = 0, 0, 0
+        
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        for images, labels in loop:
+            # non_blocking allows async data transfer
+            images, labels = images.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
             optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
             
-            # Forward
-            ea = model(anchor)
-            ep = model(positive)
-            en = model(negative)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
-            # Loss
-            loss = criterion(ea, ep, en)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-            if i % 10 == 0:
-                print(f"Epoch {epoch} | Batch {i} | Loss: {loss.item():.4f}")
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            loop.set_postfix(acc=100 * correct / total)
         
-        avg_loss = total_loss / len(dataloader)
-        print(f"===> Fim Epoch {epoch} | Média Loss: {avg_loss:.4f}")
+        # Validation
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+        
+        print(f"Epoch {epoch+1}: Train Acc: {100*correct/total:.1f}% | Val Acc: {100*val_correct/val_total:.1f}%")
+        torch.save(model.state_dict(), "best_city_model.pth")
 
-    # 5. Salvar
-    torch.save(model.state_dict(), "vpr_resnet18_l2.pth")
-    print("Modelo salvo.")
+if __name__ == "__main__":
+    main()
