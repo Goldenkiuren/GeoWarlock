@@ -4,33 +4,28 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms, models
 from PIL import Image, ImageFile
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
+from collections import Counter
 
 # --- HARDWARE OPTIMIZATIONS ---
-# Enable TF32 (Massive speedup on RTX 4080)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-NUM_EPOCHS = 5
-LEARNING_RATE = 1e-4
+NUM_EPOCHS = 1 
+LEARNING_RATE = 1e-5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
 USE_SPATIAL_SPLIT = True 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-# Paths
-DB_SUBPATH = os.path.join('database', 'images') 
-SEQ_INFO_FILE = os.path.join('database', 'seq_info.csv')
-RAW_DATA_FILE = os.path.join('database', 'raw.csv')
 
 class CityClassificationDataset(Dataset):
     def __init__(self, image_paths, labels, transform=None):
@@ -60,53 +55,106 @@ def create_splits(root_dir, val_size=0.2):
     classes.sort()
     class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
     
-    print(f"Found {len(classes)} cities. Using Spatial Split: {USE_SPATIAL_SPLIT}")
+    print(f"Found {len(classes)} cities.")
+    print("Scanning both 'database' and 'query' folders with Quality Filters...")
+
+    SUB_FOLDERS = ['database', 'query']
 
     for city in classes:
         city_path = os.path.join(root_dir, city)
-        images_dir = os.path.join(city_path, DB_SUBPATH)
-        seq_path = os.path.join(city_path, SEQ_INFO_FILE)
-        raw_path = os.path.join(city_path, RAW_DATA_FILE)
         
-        if not os.path.exists(images_dir):
+        city_image_paths = []
+        city_gps_coords = [] 
+        
+        # Load GPS Data Lookup
+        key_to_gps = {}
+        # Check both subfolders for raw.csv to build a master GPS map for the city
+        for sub in SUB_FOLDERS:
+            raw_path = os.path.join(city_path, sub, 'raw.csv')
+            if os.path.exists(raw_path):
+                try:
+                    df_raw = pd.read_csv(raw_path)
+                    for _, row in df_raw.iterrows():
+                        key_to_gps[str(row['key'])] = (row['lat'], row['lon'])
+                except:
+                    pass
+
+        # Collect Images
+        for sub in SUB_FOLDERS:
+            base_path = os.path.join(city_path, sub)
+            images_dir = os.path.join(base_path, 'images')
+            meta_path = os.path.join(base_path, 'postprocessed.csv')
+            
+            if not os.path.exists(images_dir):
+                continue
+            
+            # Load Filter
+            allowed_keys = None
+            if os.path.exists(meta_path):
+                try:
+                    df_meta = pd.read_csv(meta_path)
+                    clean_df = df_meta[(df_meta['night'] == False) & (df_meta['control_panel'] == False)]
+                    allowed_keys = set(clean_df['key'].astype(str))
+                except:
+                    pass 
+
+            valid_exts = ('.jpg', '.jpeg', '.png')
+            for f in os.listdir(images_dir):
+                if f.lower().endswith(valid_exts):
+                    key = os.path.splitext(f)[0]
+                    if allowed_keys is not None and key not in allowed_keys:
+                        continue 
+                    
+                    full_path = os.path.join(images_dir, f)
+                    city_image_paths.append(full_path)
+                    
+                    # Get GPS
+                    if key in key_to_gps:
+                        city_gps_coords.append(key_to_gps[key])
+                    else:
+                        city_gps_coords.append((0.0, 0.0))
+
+        if not city_image_paths:
             continue
 
-        valid_exts = ('.jpg', '.jpeg', '.png')
-        key_to_path = {os.path.splitext(f)[0]: os.path.join(images_dir, f) 
-                       for f in os.listdir(images_dir) if f.lower().endswith(valid_exts)}
+        print(f"  {city}: {len(city_image_paths)} images (Unique GPS: {len(np.unique(city_gps_coords, axis=0))})")
         
-        # Strategy 1: Spatial Split
-        if USE_SPATIAL_SPLIT and os.path.exists(raw_path):
-            try:
-                df_raw = pd.read_csv(raw_path)
-                df_raw = df_raw[df_raw['key'].isin(key_to_path.keys())]
-                coords = df_raw[['lat', 'lon']].values
-                kmeans = KMeans(n_clusters=5, n_init=10, random_state=42)
-                df_raw['cluster'] = kmeans.fit_predict(coords)
-                
-                val_cluster_id = 0 
-                train_keys = df_raw[df_raw['cluster'] != val_cluster_id]['key'].tolist()
-                val_keys = df_raw[df_raw['cluster'] == val_cluster_id]['key'].tolist()
-                
-                print(f"  {city} (Spatial): Train {len(train_keys)} | Val {len(val_keys)}")
-                for k in train_keys: train_paths.append(key_to_path[k]); train_labels.append(class_to_idx[city])
-                for k in val_keys: val_paths.append(key_to_path[k]); val_labels.append(class_to_idx[city])
-                continue 
-            except Exception:
-                pass 
+        # Check if we have enough UNIQUE coordinates to actually cluster
+        coords = np.array(city_gps_coords)
+        unique_coords = np.unique(coords, axis=0)
+        
+        # We need at least 5 unique locations to do a 5-cluster split
+        can_use_spatial = USE_SPATIAL_SPLIT and len(unique_coords) >= 5
 
-        # Strategy 2: Sequence Split (Fallback)
-        if os.path.exists(seq_path):
-            df = pd.read_csv(seq_path)
-            df = df[df['key'].isin(key_to_path.keys())]
-            if 'sequence_key' in df.columns:
-                seq_groups = df.groupby('sequence_key')['key'].apply(list).tolist()
-                train_seqs, val_seqs = train_test_split(seq_groups, test_size=val_size, random_state=42)
-                for seq in train_seqs:
-                    for k in seq: train_paths.append(key_to_path[k]); train_labels.append(class_to_idx[city])
-                for seq in val_seqs:
-                    for k in seq: val_paths.append(key_to_path[k]); val_labels.append(class_to_idx[city])
-                print(f"  {city} (Sequence): Train {len(train_seqs)} seqs | Val {len(val_seqs)} seqs")
+        if can_use_spatial:
+            try:
+                kmeans = KMeans(n_clusters=5, n_init=10, random_state=42)
+                clusters = kmeans.fit_predict(coords)
+                
+                # Use cluster 0 for validation
+                val_cluster_id = 0
+                
+                for i, path in enumerate(city_image_paths):
+                    if clusters[i] == val_cluster_id:
+                        val_paths.append(path)
+                        val_labels.append(class_to_idx[city])
+                    else:
+                        train_paths.append(path)
+                        train_labels.append(class_to_idx[city])
+            except Exception as e:
+                print(f"  [Warning] {city}: Spatial split error ({e}). Falling back to random.")
+                can_use_spatial = False # Trigger fallback below
+
+        # Strategy 2: Random Split (Fallback)
+        if not can_use_spatial:
+            # print(f"  Note: Using Random Split for {city} (insufficient GPS data)")
+            tr_paths, va_paths = train_test_split(city_image_paths, test_size=val_size, random_state=42)
+            for p in tr_paths:
+                train_paths.append(p)
+                train_labels.append(class_to_idx[city])
+            for p in va_paths:
+                val_paths.append(p)
+                val_labels.append(class_to_idx[city])
 
     return train_paths, train_labels, val_paths, val_labels, len(classes)
 
@@ -128,15 +176,23 @@ class ViTForCityClassification(nn.Module):
 def main():
     dataset_root = "data" 
     
-    print("Preparing Robust Splits...")
+    print("Preparing Clean Splits (Database + Query)...")
     train_paths, train_y, val_paths, val_y, num_classes = create_splits(dataset_root)
-    print(f"Total: {len(train_paths)} Train, {len(val_paths)} Val")
+    print(f"Total Valid Images: {len(train_paths)} Train, {len(val_paths)} Val")
 
+    # Balancing Weights
+    print("Computing Class Weights...")
+    class_counts = Counter(train_y)
+    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
+    sample_weights = [class_weights[label] for label in train_y]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    # Aggressive Augmentation
     train_transform = transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomResizedCrop(IMG_SIZE, scale=(0.4, 1.0)), 
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.RandomRotation(degrees=15),
+        transforms.RandomRotation(degrees=20),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -149,30 +205,17 @@ def main():
     train_dataset = CityClassificationDataset(train_paths, train_y, transform=train_transform)
     val_dataset = CityClassificationDataset(val_paths, val_y, transform=val_transform)
 
-    # UPDATED: Increased workers slightly for your high-end CPU
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=12,  # Increased from 8
-        pin_memory=True,
-        persistent_workers=True, 
-        prefetch_factor=2
+        train_dataset, batch_size=BATCH_SIZE, sampler=sampler, 
+        num_workers=12, pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=8, 
-        pin_memory=True,
-        persistent_workers=True, 
-        prefetch_factor=2
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
+        num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
 
     model = ViTForCityClassification(num_classes=num_classes).to(DEVICE)
-    
     model = torch.compile(model)
-
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scaler = torch.amp.GradScaler('cuda')
