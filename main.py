@@ -19,7 +19,7 @@ torch.backends.cudnn.benchmark = True
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-NUM_EPOCHS = 3
+NUM_EPOCHS = 2
 LEARNING_RATE = 1e-5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
