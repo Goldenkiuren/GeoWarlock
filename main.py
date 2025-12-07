@@ -19,7 +19,7 @@ torch.backends.cudnn.benchmark = True
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-NUM_EPOCHS = 1 
+NUM_EPOCHS = 3
 LEARNING_RATE = 1e-5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224
@@ -51,33 +51,48 @@ def create_splits(root_dir, val_size=0.2):
     train_paths, train_labels = [], []
     val_paths, val_labels = [], []
     
-    classes = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
-    classes.sort()
-    class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+    # 1. Identificar classes válidas
+    raw_classes = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+    raw_classes.sort()
     
-    print(f"Found {len(classes)} cities.")
-    print("Scanning both 'database' and 'query' folders with Quality Filters...")
-
+    final_classes = [] 
+    
+    print(f"Scanning {len(raw_classes)} potential cities...")
+    
     SUB_FOLDERS = ['database', 'query']
+    city_data_buffer = {}
 
-    for city in classes:
+    for city in raw_classes:
         city_path = os.path.join(root_dir, city)
-        
         city_image_paths = []
         city_gps_coords = [] 
+        city_sequences = [] # Nova lista para armazenar IDs de sequência
         
-        # Load GPS Data Lookup
+        # Load Metadata Lookups
         key_to_gps = {}
-        # Check both subfolders for raw.csv to build a master GPS map for the city
+        key_to_seq = {} # Mapa de imagem -> sequencia
+
         for sub in SUB_FOLDERS:
-            raw_path = os.path.join(city_path, sub, 'raw.csv')
+            base_sub_path = os.path.join(city_path, sub)
+            
+            # Tenta ler raw.csv (GPS)
+            raw_path = os.path.join(base_sub_path, 'raw.csv')
             if os.path.exists(raw_path):
                 try:
                     df_raw = pd.read_csv(raw_path)
                     for _, row in df_raw.iterrows():
                         key_to_gps[str(row['key'])] = (row['lat'], row['lon'])
-                except:
-                    pass
+                except: pass
+
+            # Tenta ler seq_info.csv (Sequência - Salvação para Buenos Aires)
+            seq_path = os.path.join(base_sub_path, 'seq_info.csv')
+            if os.path.exists(seq_path):
+                try:
+                    df_seq = pd.read_csv(seq_path)
+                    if 'key' in df_seq.columns and 'sequence_key' in df_seq.columns:
+                        for _, row in df_seq.iterrows():
+                            key_to_seq[str(row['key'])] = str(row['sequence_key'])
+                except: pass
 
         # Collect Images
         for sub in SUB_FOLDERS:
@@ -88,15 +103,14 @@ def create_splits(root_dir, val_size=0.2):
             if not os.path.exists(images_dir):
                 continue
             
-            # Load Filter
+            # Load Filter (Day/Night)
             allowed_keys = None
             if os.path.exists(meta_path):
                 try:
                     df_meta = pd.read_csv(meta_path)
                     clean_df = df_meta[(df_meta['night'] == False) & (df_meta['control_panel'] == False)]
                     allowed_keys = set(clean_df['key'].astype(str))
-                except:
-                    pass 
+                except: pass 
 
             valid_exts = ('.jpg', '.jpeg', '.png')
             for f in os.listdir(images_dir):
@@ -108,32 +122,53 @@ def create_splits(root_dir, val_size=0.2):
                     full_path = os.path.join(images_dir, f)
                     city_image_paths.append(full_path)
                     
-                    # Get GPS
+                    # 1. Tenta pegar GPS
                     if key in key_to_gps:
                         city_gps_coords.append(key_to_gps[key])
                     else:
                         city_gps_coords.append((0.0, 0.0))
+                    
+                    # 2. Tenta pegar Sequência (Se não tiver, usa o próprio nome da imagem como ID único)
+                    if key in key_to_seq:
+                        city_sequences.append(key_to_seq[key])
+                    else:
+                        city_sequences.append(key) 
 
-        if not city_image_paths:
+        # --- MINIMUM SIZE FILTER ---
+        if len(city_image_paths) < 200:
+            print(f"  [Skipping] {city}: Too few images ({len(city_image_paths)})")
             continue
+            
+        final_classes.append(city)
+        city_data_buffer[city] = (city_image_paths, city_gps_coords, city_sequences)
 
-        print(f"  {city}: {len(city_image_paths)} images (Unique GPS: {len(np.unique(city_gps_coords, axis=0))})")
+    class_to_idx = {cls_name: i for i, cls_name in enumerate(final_classes)}
+    print(f"Final Class List: {len(final_classes)} cities.")
+
+    # Process Splits
+    for city in final_classes:
+        city_image_paths, city_gps_coords, city_sequences = city_data_buffer[city]
         
-        # Check if we have enough UNIQUE coordinates to actually cluster
         coords = np.array(city_gps_coords)
         unique_coords = np.unique(coords, axis=0)
+        n_unique_gps = len(unique_coords)
         
-        # We need at least 5 unique locations to do a 5-cluster split
-        can_use_spatial = USE_SPATIAL_SPLIT and len(unique_coords) >= 5
+        unique_sequences = list(set(city_sequences))
+        n_unique_seq = len(unique_sequences)
+        
+        print(f"  {city}: {len(city_image_paths)} imgs | {n_unique_gps} locs | {n_unique_seq} seqs", end="")
+        
+        # Estratégia 1: Spatial Split (Melhor - Usa GPS)
+        can_use_spatial = USE_SPATIAL_SPLIT and n_unique_gps >= 5
+        split_done = False
 
         if can_use_spatial:
             try:
                 kmeans = KMeans(n_clusters=5, n_init=10, random_state=42)
                 clusters = kmeans.fit_predict(coords)
+                print(" -> Spatial Split (GPS)")
                 
-                # Use cluster 0 for validation
                 val_cluster_id = 0
-                
                 for i, path in enumerate(city_image_paths):
                     if clusters[i] == val_cluster_id:
                         val_paths.append(path)
@@ -141,13 +176,29 @@ def create_splits(root_dir, val_size=0.2):
                     else:
                         train_paths.append(path)
                         train_labels.append(class_to_idx[city])
-            except Exception as e:
-                print(f"  [Warning] {city}: Spatial split error ({e}). Falling back to random.")
-                can_use_spatial = False # Trigger fallback below
+                split_done = True
+            except:
+                print(" -> GPS Split Failed. Trying Sequence...")
+        
+        # Estratégia 2: Sequence Split
+        if not split_done and n_unique_seq > 1:
+            print(" -> Sequence Split (No GPS)")
+            train_seqs, val_seqs = train_test_split(unique_sequences, test_size=val_size, random_state=42)
+            train_seq_set = set(train_seqs) 
+            
+            for i, path in enumerate(city_image_paths):
+                seq_id = city_sequences[i]
+                if seq_id in train_seq_set:
+                    train_paths.append(path)
+                    train_labels.append(class_to_idx[city])
+                else:
+                    val_paths.append(path)
+                    val_labels.append(class_to_idx[city])
+            split_done = True
 
-        # Strategy 2: Random Split (Fallback)
-        if not can_use_spatial:
-            # print(f"  Note: Using Random Split for {city} (insufficient GPS data)")
+        # Estratégia 3: Random Split
+        if not split_done:
+            print(" -> Random Split (Fallback)")
             tr_paths, va_paths = train_test_split(city_image_paths, test_size=val_size, random_state=42)
             for p in tr_paths:
                 train_paths.append(p)
@@ -156,7 +207,7 @@ def create_splits(root_dir, val_size=0.2):
                 val_paths.append(p)
                 val_labels.append(class_to_idx[city])
 
-    return train_paths, train_labels, val_paths, val_labels, len(classes)
+    return train_paths, train_labels, val_paths, val_labels, len(final_classes)
 
 class ViTForCityClassification(nn.Module):
     def __init__(self, num_classes):
@@ -180,14 +231,15 @@ def main():
     train_paths, train_y, val_paths, val_y, num_classes = create_splits(dataset_root)
     print(f"Total Valid Images: {len(train_paths)} Train, {len(val_paths)} Val")
 
-    # Balancing Weights
-    print("Computing Class Weights...")
+    # --- BALANCING STRATEGY: SOFT (SQUARE ROOT) ---
+    print("Computing Class Weights (Soft Balancing)...")
     class_counts = Counter(train_y)
-    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
+    class_weights = {cls: 1.0 / (count ** 0.5) for cls, count in class_counts.items()}
+    
     sample_weights = [class_weights[label] for label in train_y]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    # Aggressive Augmentation
+    # Augmentation
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(IMG_SIZE, scale=(0.4, 1.0)), 
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
@@ -222,6 +274,9 @@ def main():
     
     print(f"Starting Training on {DEVICE}...")
     
+    # Variável para rastrear a melhor acurácia
+    best_val_acc = 0.0
+
     for epoch in range(NUM_EPOCHS):
         model.train()
         train_loss, correct, total = 0, 0, 0
@@ -256,8 +311,18 @@ def main():
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
         
-        print(f"Epoch {epoch+1}: Train Acc: {100*correct/total:.1f}% | Val Acc: {100*val_correct/val_total:.1f}%")
-        torch.save(model.state_dict(), "best_city_model.pth")
+        # Calcular acurácia da validação
+        epoch_val_acc = 100 * val_correct / val_total
+        print(f"Epoch {epoch+1}: Train Acc: {100*correct/total:.1f}% | Val Acc: {epoch_val_acc:.1f}%")
+
+        # --- LÓGICA DE SALVAMENTO INTELIGENTE ---
+        # Só salva se for o melhor resultado até agora
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            torch.save(model.state_dict(), "best_city_model.pth")
+            print(f"  -> New Best Model Saved! ({best_val_acc:.1f}%)")
+        else:
+            print(f"  -> Validation did not improve (Best: {best_val_acc:.1f}%)")
 
 if __name__ == "__main__":
     main()

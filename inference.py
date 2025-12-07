@@ -10,10 +10,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ALPHABETICAL list of your 30 cities
 CLASSES = [
-    'amman', 'amsterdam', 'athens', 'austin', 'bangkok', 'bengaluru', 
+    'amsterdam', 'athens', 'austin', 'bangkok', 'bengaluru', 
     'berlin', 'boston', 'budapest', 'buenosaires', 'cph', 'goa', 
     'helsinki', 'kampala', 'london', 'manila', 'melbourne', 'miami', 
-    'moscow', 'nairobi', 'ottawa', 'paris', 'phoenix', 'saopaulo', 
+    'moscow', 'ottawa', 'paris', 'phoenix', 'saopaulo', 
     'sf', 'stockholm', 'tokyo', 'toronto', 'trondheim', 'zurich'
 ]
 
