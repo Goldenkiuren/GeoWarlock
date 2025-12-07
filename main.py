@@ -19,10 +19,10 @@ torch.backends.cudnn.benchmark = True
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
-NUM_EPOCHS = 2
-LEARNING_RATE = 1e-5
+NUM_EPOCHS = 5
+LEARNING_RATE = 1e-4    # Increased slightly (1e-5 -> 1e-4) because Scheduler will decay it
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_SIZE = 224
+IMG_SIZE = 224          # KEPT: 224 (Strictly enforced by torchvision ViT)
 USE_SPATIAL_SPLIT = True 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -66,11 +66,11 @@ def create_splits(root_dir, val_size=0.2):
         city_path = os.path.join(root_dir, city)
         city_image_paths = []
         city_gps_coords = [] 
-        city_sequences = [] # Nova lista para armazenar IDs de sequência
+        city_sequences = [] 
         
         # Load Metadata Lookups
         key_to_gps = {}
-        key_to_seq = {} # Mapa de imagem -> sequencia
+        key_to_seq = {} 
 
         for sub in SUB_FOLDERS:
             base_sub_path = os.path.join(city_path, sub)
@@ -84,7 +84,7 @@ def create_splits(root_dir, val_size=0.2):
                         key_to_gps[str(row['key'])] = (row['lat'], row['lon'])
                 except: pass
 
-            # Tenta ler seq_info.csv (Sequência - Salvação para Buenos Aires)
+            # Tenta ler seq_info.csv (Sequência)
             seq_path = os.path.join(base_sub_path, 'seq_info.csv')
             if os.path.exists(seq_path):
                 try:
@@ -122,13 +122,11 @@ def create_splits(root_dir, val_size=0.2):
                     full_path = os.path.join(images_dir, f)
                     city_image_paths.append(full_path)
                     
-                    # 1. Tenta pegar GPS
                     if key in key_to_gps:
                         city_gps_coords.append(key_to_gps[key])
                     else:
                         city_gps_coords.append((0.0, 0.0))
                     
-                    # 2. Tenta pegar Sequência (Se não tiver, usa o próprio nome da imagem como ID único)
                     if key in key_to_seq:
                         city_sequences.append(key_to_seq[key])
                     else:
@@ -158,7 +156,6 @@ def create_splits(root_dir, val_size=0.2):
         
         print(f"  {city}: {len(city_image_paths)} imgs | {n_unique_gps} locs | {n_unique_seq} seqs", end="")
         
-        # Estratégia 1: Spatial Split (Melhor - Usa GPS)
         can_use_spatial = USE_SPATIAL_SPLIT and n_unique_gps >= 5
         split_done = False
 
@@ -180,7 +177,6 @@ def create_splits(root_dir, val_size=0.2):
             except:
                 print(" -> GPS Split Failed. Trying Sequence...")
         
-        # Estratégia 2: Sequence Split
         if not split_done and n_unique_seq > 1:
             print(" -> Sequence Split (No GPS)")
             train_seqs, val_seqs = train_test_split(unique_sequences, test_size=val_size, random_state=42)
@@ -196,7 +192,6 @@ def create_splits(root_dir, val_size=0.2):
                     val_labels.append(class_to_idx[city])
             split_done = True
 
-        # Estratégia 3: Random Split
         if not split_done:
             print(" -> Random Split (Fallback)")
             tr_paths, va_paths = train_test_split(city_image_paths, test_size=val_size, random_state=42)
@@ -231,11 +226,10 @@ def main():
     train_paths, train_y, val_paths, val_y, num_classes = create_splits(dataset_root)
     print(f"Total Valid Images: {len(train_paths)} Train, {len(val_paths)} Val")
 
-    # --- BALANCING STRATEGY: SOFT (SQUARE ROOT) ---
-    print("Computing Class Weights (Soft Balancing)...")
+    # --- BALANCING STRATEGY: HARD (1/COUNT) ---
+    print("Computing Class Weights (Hard Balancing - 1/Count)...")
     class_counts = Counter(train_y)
-    class_weights = {cls: 1.0 / (count ** 0.5) for cls, count in class_counts.items()}
-    
+    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
     sample_weights = [class_weights[label] for label in train_y]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
@@ -268,13 +262,21 @@ def main():
 
     model = ViTForCityClassification(num_classes=num_classes).to(DEVICE)
     model = torch.compile(model)
-    criterion = nn.CrossEntropyLoss()
+    
+    # --- UPGRADE 1: Label Smoothing ---
+    # Helps reduce the "Stockholm Sink" effect by preventing overconfidence
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    
+    # --- UPGRADE 2: Cosine Scheduler ---
+    # Helps the model settle into a better minimum by smoothly lowering LR
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    
     scaler = torch.amp.GradScaler('cuda')
     
     print(f"Starting Training on {DEVICE}...")
     
-    # Variável para rastrear a melhor acurácia
     best_val_acc = 0.0
 
     for epoch in range(NUM_EPOCHS):
@@ -300,6 +302,9 @@ def main():
             correct += (predicted == labels).sum().item()
             loop.set_postfix(acc=100 * correct / total)
         
+        # Step the Scheduler
+        scheduler.step()
+        
         # Validation
         model.eval()
         val_correct, val_total = 0, 0
@@ -311,18 +316,19 @@ def main():
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
         
-        # Calcular acurácia da validação
         epoch_val_acc = 100 * val_correct / val_total
-        print(f"Epoch {epoch+1}: Train Acc: {100*correct/total:.1f}% | Val Acc: {epoch_val_acc:.1f}%")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1}: Train Acc: {100*correct/total:.1f}% | Val Acc: {epoch_val_acc:.1f}% | LR: {current_lr:.2e}")
 
-        # --- LÓGICA DE SALVAMENTO INTELIGENTE ---
-        # Só salva se for o melhor resultado até agora
+        # --- SAVE EVERY EPOCH ---
+        save_name = f"city_model_epoch_{epoch+1}.pth"
+        torch.save(model.state_dict(), save_name)
+        print(f"  -> Saved checkpoint: {save_name}")
+
         if epoch_val_acc > best_val_acc:
             best_val_acc = epoch_val_acc
             torch.save(model.state_dict(), "best_city_model.pth")
-            print(f"  -> New Best Model Saved! ({best_val_acc:.1f}%)")
-        else:
-            print(f"  -> Validation did not improve (Best: {best_val_acc:.1f}%)")
+            print(f"  -> New Best Model (Also saved as best_city_model.pth)")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 import os
 import torch
 import pandas as pd
+import argparse  # Added for command line arguments
 from PIL import Image
 from torchvision import transforms, models
 import torch.nn as nn
@@ -8,7 +9,7 @@ import torch.nn as nn
 # --- CONFIGURAÇÃO ---
 TEST_FOLDER = "test"        # Nome da pasta onde estão suas imagens
 DATASET_ROOT = "data"       # Pasta original para ler os nomes das classes
-MODEL_PATH = "best_city_model.pth"
+# MODEL_PATH removed here, will be handled via arguments
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Mapeamento do prefixo do arquivo para o nome EXATO da pasta da classe
@@ -101,6 +102,14 @@ class ViTForCityClassification(nn.Module):
         return self.vit(x)
 
 def main():
+    # --- ARGUMENT PARSING ---
+    parser = argparse.ArgumentParser(description="Run City Classification Inference")
+    parser.add_argument("--model", type=str, default="best_city_model.pth", 
+                        help="Path to the .pth model file to use")
+    args = parser.parse_args()
+    model_path = args.model
+    # ------------------------
+
     # 1. Carregar Classes
     classes = get_classes(DATASET_ROOT)
     num_classes = len(classes)
@@ -110,8 +119,12 @@ def main():
     model = ViTForCityClassification(num_classes=num_classes).to(DEVICE)
     
     # --- CORREÇÃO DO TORCH.COMPILE (Fix do _orig_mod) ---
-    print(f"Loading model from {MODEL_PATH}...")
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    if not os.path.exists(model_path):
+        print(f"Error: Model file '{model_path}' not found!")
+        return
+
+    print(f"Loading model from {model_path}...")
+    checkpoint = torch.load(model_path, map_location=DEVICE)
     
     new_state_dict = {}
     for key, value in checkpoint.items():
@@ -125,13 +138,11 @@ def main():
     model.eval()
     
     # 3. Definir Transformação com TTA (Test-Time Augmentation)
-    # FIX: Aspect Ratio preservado com Resize(256)
     tta_preprocess = transforms.Compose([
-        transforms.Resize(256),       # Redimensiona o lado menor para 256 (mantém aspect ratio)
+        transforms.Resize(256),       # Redimensiona o lado menor para 256
         transforms.FiveCrop(224),     # Gera 5 cortes: 4 cantos + centro
     ])
 
-    # Transformação final para converter cada corte em tensor
     norm_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -139,8 +150,6 @@ def main():
 
     # 4. Preparar Estatísticas e Rodar
     stats = {code: {'1st': 0, '2nd': 0, '3rd': 0, 'miss': 0, 'total': 0} for code in PREFIX_MAP.keys()}
-    
-    # Inicializar estatísticas por continente
     continent_stats = {}
     
     print(f"\nScanning folder '{TEST_FOLDER}'...")
@@ -162,7 +171,6 @@ def main():
         true_class_name = PREFIX_MAP[prefix]
         true_continent = CITY_TO_CONTINENT.get(true_class_name, "Unknown")
         
-        # Inicializa o continente se não existir ainda
         if true_continent not in continent_stats:
             continent_stats[true_continent] = {'1st': 0, '2nd': 0, '3rd': 0, 'miss': 0, 'total': 0}
 
@@ -171,10 +179,7 @@ def main():
             image = Image.open(img_path).convert("RGB")
             
             # --- TTA LOGIC START ---
-            # 1. Gerar 5 cortes (Tuple of Images)
             crops = tta_preprocess(image)
-            
-            # 2. Converter cada corte e empilhar em um batch [5, 3, 224, 224]
             input_tensor = torch.stack([norm_transform(crop) for crop in crops]).to(DEVICE)
             
         except Exception as e:
@@ -182,20 +187,14 @@ def main():
             continue
 
         with torch.no_grad():
-            # 3. Inferência no batch de 5 imagens
-            outputs = model(input_tensor) # Shape: [5, num_classes]
-            
-            # 4. Calcular probabilidades para cada corte
+            outputs = model(input_tensor) 
             probs_per_crop = torch.nn.functional.softmax(outputs, dim=1)
-            
-            # 5. Média das probabilidades dos 5 cortes
-            avg_probs = torch.mean(probs_per_crop, dim=0, keepdim=True) # Shape: [1, num_classes]
-            
+            avg_probs = torch.mean(probs_per_crop, dim=0, keepdim=True) 
             top3_prob, top3_idx = torch.topk(avg_probs, 3)
             
         top3_names = [classes[idx] for idx in top3_idx[0]]
         
-        # --- UPDATE CITY STATS (Exato) ---
+        # --- UPDATE CITY STATS ---
         stats[prefix]['total'] += 1
         
         if true_class_name == top3_names[0]:
@@ -210,10 +209,9 @@ def main():
             stats[prefix]['miss'] += 1
             print(f"❌ {fname} -> {top3_names[0]} (True: {true_class_name} not in top 3)")
 
-        # --- UPDATE CONTINENT STATS (Agnóstico à Cidade) ---
+        # --- UPDATE CONTINENT STATS ---
         continent_stats[true_continent]['total'] += 1
         
-        # Pegamos o continente de cada uma das top 3 predições
         pred_cont_1 = CITY_TO_CONTINENT.get(top3_names[0], "Unknown")
         pred_cont_2 = CITY_TO_CONTINENT.get(top3_names[1], "Unknown")
         pred_cont_3 = CITY_TO_CONTINENT.get(top3_names[2], "Unknown")
