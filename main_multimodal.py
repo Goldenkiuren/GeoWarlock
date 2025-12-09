@@ -22,10 +22,10 @@ torch.backends.cudnn.benchmark = True
 # --- CONFIGURATION ---
 BATCH_SIZE = 128
 NUM_EPOCHS = 15        # Kept 12 (Multimodal takes longer to converge)
-LEARNING_RATE = 5e-5    # Kept lower LR for stability with Fusion
+LEARNING_RATE = 1e-4   # Kept lower LR for stability with Fusion
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 224 
-OCR_CACHE_FILE = "ocr_features_smart.pkl" 
+OCR_CACHE_FILE = "ocr_features_final_production.pkl"
 USE_SPATIAL_SPLIT = True # Adopting logic from main.py
 
 # Probabilidades de "Cegar" uma modalidade (Modality Dropout)
@@ -317,11 +317,11 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, sampler=sampler, 
-        num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2
+        num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False, 
-        num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2
+        num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
 
     # 7. Model Setup
