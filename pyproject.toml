@@ -1,7 +1,7 @@
 [project]
 name = "geowarlock"
 version = "0.1.0"
-description = "Multimodal geolocation model using ViT + OCR"
+description = "Geolocalização com modelos ViT16 e DinoV2"
 authors = [{name = "Augusto Mattei Grohmann"}, {name = "Angelo Fernandes Oliveira"}]
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
