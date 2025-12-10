@@ -90,7 +90,7 @@ class DinoV2FineTuning(nn.Module):
         return self.head(features)
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="best_finetuned_model.pth")
+    parser.add_argument("--model", type=str, default="best_models/dinov2_best.pth")
     args = parser.parse_args()
     classes = get_classes(DATASET_ROOT)
     num_classes = len(classes)
