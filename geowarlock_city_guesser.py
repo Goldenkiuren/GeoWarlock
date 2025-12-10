@@ -9,10 +9,6 @@ import torch.nn as nn
 from torchvision import transforms, models
 import customtkinter as ctk
 
-# ==============================================================================
-# CONFIGURATION & CLASSES
-# ==============================================================================
-
 MODEL_PATHS = {
     "ViT": "best_models/vit16_best.pth",
     "Dino Frozen": "best_models/frozen_dinov2_best.pth",
@@ -28,9 +24,6 @@ CLASS_NAMES = [
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ==============================================================================
-# MODEL DEFINITIONS
-# ==============================================================================
 
 class DinoV2FineTuning(nn.Module):
     def __init__(self, num_classes):
@@ -76,10 +69,6 @@ class DinoV2ForCityClassification(nn.Module):
         features = self.backbone(x)
         return self.head(features)
 
-# ==============================================================================
-# GUI APPLICATION
-# ==============================================================================
-
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -88,7 +77,7 @@ class GeoWarlockApp(ctk.CTk):
         super().__init__()
 
         self.title("GeoWarlock")
-        self.geometry("950x700") # Slight height increase to prevent clipping, but kept compact
+        self.geometry("950x700")
         
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -97,27 +86,21 @@ class GeoWarlockApp(ctk.CTk):
         self.loaded_models = {}
         self.num_classes = len(CLASS_NAMES)
 
-        # --- Sidebar ---
         self.sidebar_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
         
-        # Logo
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="GeoWarlock", font=ctk.CTkFont(size=22, weight="bold"))
         self.logo_label.pack(padx=20, pady=(30, 20))
 
-        # Load Button
         self.btn_load = ctk.CTkButton(self.sidebar_frame, text="Load Image", command=self.select_image)
         self.btn_load.pack(padx=20, pady=10)
 
-        # Divider
         self.divider = ctk.CTkFrame(self.sidebar_frame, height=2, fg_color="gray30")
         self.divider.pack(padx=20, pady=20, fill="x")
 
-        # Options
         self.lbl_model = ctk.CTkLabel(self.sidebar_frame, text="Select Arcana (Model):", anchor="w")
         self.lbl_model.pack(padx=20, pady=(0, 10), anchor="w")
 
-        # REORDERED LIST
         self.model_var = ctk.StringVar(value="ViT")
         models_list = ["ViT", "Dino Frozen", "Dino Tuned", "All 3"]
         
@@ -127,7 +110,6 @@ class GeoWarlockApp(ctk.CTk):
 
         ctk.CTkLabel(self.sidebar_frame, text="").pack(pady=10)
 
-        # Run Button
         self.btn_run = ctk.CTkButton(
             self.sidebar_frame, 
             text="Guess City", 
@@ -136,18 +118,14 @@ class GeoWarlockApp(ctk.CTk):
         )
         self.btn_run.pack(padx=20, pady=20)
         
-        # Status
         self.status_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.status_frame.pack(side="bottom", fill="x", pady=20)
         self.status_label = ctk.CTkLabel(self.status_frame, text="Ready", text_color="gray", font=("Arial", 12))
         self.status_label.pack()
 
-        # --- Main Area ---
         self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         
-        # Layout Weights: slightly more space for text (row 1) relative to image (row 0)
-        # to ensure the top lines aren't cut off.
         self.main_frame.grid_rowconfigure(0, weight=4) 
         self.main_frame.grid_rowconfigure(1, weight=3)
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -158,7 +136,6 @@ class GeoWarlockApp(ctk.CTk):
         )
         self.image_label.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
 
-        # Results Container
         self.results_bg = ctk.CTkFrame(self.main_frame, corner_radius=10, fg_color="#2B2B2B")
         self.results_bg.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
         
@@ -235,7 +212,7 @@ class GeoWarlockApp(ctk.CTk):
         self.status_label.configure(text="Processing...", text_color="white")
         
         selection = self.model_var.get()
-        # Enforce correct order for "All 3"
+
         if selection == "All 3":
             models_to_run = ["ViT", "Dino Frozen", "Dino Tuned"]
         else:
@@ -271,7 +248,6 @@ class GeoWarlockApp(ctk.CTk):
                         prob = top3_prob[0][i].item() * 100
                         results_text += f"{i+1}. {city.upper()}: {prob:.1f}%\n"
                     
-                    # Only add newline if it's not the last model to save vertical space
                     if m_name != models_to_run[-1]:
                         results_text += "\n"
 
