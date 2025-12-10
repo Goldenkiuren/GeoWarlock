@@ -16,7 +16,7 @@ import customtkinter as ctk
 MODEL_PATHS = {
     "ViT": "best_models/vit16_best.pth",
     "Dino Frozen": "best_models/frozen_dinov2_best.pth",
-    "Dino Tuned": "best_finetuned_model.pth"
+    "Dino Tuned": "best_models/dinov2_best.pth"
 }
 
 CLASS_NAMES = [
