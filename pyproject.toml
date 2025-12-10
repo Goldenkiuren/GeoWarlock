@@ -2,26 +2,33 @@
 name = "geowarlock"
 version = "0.1.0"
 description = "Multimodal geolocation model using ViT + OCR"
-authors = ["Augusto Mattei Grohmann", "Angelo Fernandes Oliveira"]
+authors = [{name = "Augusto Mattei Grohmann"}, {name = "Angelo Fernandes Oliveira"}]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
     "easyocr",
     "langdetect",
-    "numpy",
+    "numpy<2",
     "pandas",
     "scikit-learn",
     "pillow",
     "matplotlib",
     "tqdm>=4.67.1",
+    "paddlepaddle-gpu==3.2.0",
+    "paddleocr>=3.3.2",
+    "xformers>=0.0.22",
 ]
 
 [tool.uv]
-dev-dependencies = [
-    "pytest",
-    "ruff",
-    "black",
-]
+# 1. Define the custom index (but do not make it default)
+[[tool.uv.index]]
+name = "paddle-custom"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true
+
+# 2. Explicitly map paddlepaddle-gpu to use that index
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-custom" }
